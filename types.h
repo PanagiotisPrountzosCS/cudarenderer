@@ -1,6 +1,17 @@
 #ifndef _TYPES_H
 #define _TYPES_H
 
+#include <stdint.h>
+
+typedef struct gpu_mem_t
+{
+        void* d_verts;
+        void* d_faces;
+        void* d_drawn_edges;
+        void* d_verts_transform;
+        void* d_frame_buf;
+} gpu_mem_t;
+
 typedef struct quat_f_t
 {
         float w;
@@ -20,5 +31,13 @@ typedef struct fvec3
         float y;
         float z;
 } fvec3;
+
+typedef struct pixel_t
+{
+        size_t x;
+        size_t y;
+} pixel_t;
+
+typedef uint32_t color_t;
 
 #endif

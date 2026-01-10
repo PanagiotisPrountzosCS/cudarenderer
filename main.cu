@@ -7,47 +7,161 @@
 #include "penger.h"
 #include "types.h"
 
+#define WIDTH 1280
+#define HEIGHT 720
+#define MODEL_SCALE 1.0f
 #define PI 3.141592f
 #define PI_2 6.283185f
-#define ANGULAR_VELOCITY 1  // rotations per second
+#define ANGULAR_VELOCITY 1
+#define LINE_COLOR 0x00FF00FF
+#define BLACK 0x00000000
 
 volatile sig_atomic_t should_run = 1;
-double global_start;
-double global_end;
+double global_start_ms;
+double global_end_ms;
 size_t frame_cnt;
+
+__global__ void k_transform_vertices(mat_3x3f_t m, gpu_mem_t data_buf,
+                                     size_t num_verts)
+{
+        const Vec3* old_v = (const Vec3*)data_buf.d_verts;
+        Vec3* new_v = (Vec3*)data_buf.d_verts_transform;
+        size_t tid = threadIdx.x + blockIdx.x * blockDim.x;
+        size_t total_threads = blockDim.x * gridDim.x;
+
+        for (size_t idx = tid; idx < num_verts; idx += total_threads)
+        {
+                Vec3 in = old_v[idx];
+                Vec3 out;
+
+                out.x = m.data[0][0] * in.x + m.data[0][1] * in.y +
+                        m.data[0][2] * in.z;
+                out.y = m.data[1][0] * in.x + m.data[1][1] * in.y +
+                        m.data[1][2] * in.z;
+                out.z = m.data[2][0] * in.x + m.data[2][1] * in.y +
+                        m.data[2][2] * in.z;
+
+                new_v[idx] = out;
+        }
+}
+
+__global__ void k_render_lines(gpu_mem_t data_buf, size_t num_faces)
+{
+        const Vec3* v = (const Vec3*)data_buf.d_verts_transform;
+        const Tri* f = (const Tri*)data_buf.d_faces;
+        size_t tid = threadIdx.x + blockIdx.x * blockDim.x;
+        size_t total_threads = blockDim.x * gridDim.x;
+
+        for (size_t idx = tid; idx < num_faces; idx += total_threads)
+        {
+                Tri tri_indices = f[idx];
+                Vec3 tri_vertices[3];
+                pixel_t tri_projection[3];
+
+                tri_vertices[0] = v[tri_indices.a];
+                tri_vertices[1] = v[tri_indices.b];
+                tri_vertices[2] = v[tri_indices.c];
+
+                for (int i = 0; i < 3; i++)
+                {
+                        // ASSUMES VERTICES ARE NORMALIZED, AND CENTERED AROUND
+                        // THE ORIGIN THE FRONT DIRECTION IS z. THE CAMERA IS AT
+                        // 0,0,2 WITH DIRECTION 0,0,-1. USE obj2header.py PLS
+                        float d = (2 - tri_vertices[i].z);
+                        tri_projection[i].x = MODEL_SCALE * WIDTH *
+                                              (1 + tri_vertices[i].x / d) / 2;
+                        tri_projection[i].y = MODEL_SCALE * HEIGHT *
+                                              (1 + tri_vertices[i].y / d) / 2;
+                }
+                // Bresenham's
+                // draw_line();
+                // draw_line();
+                // draw_line();
+                // Write directly to the output buffer?
+        }
+}
 
 void handle_sigint(int signum)
 {
         should_run = 0;
-        global_end = now_ms();
-        double duration = (global_end - global_start) / 1000;
+        global_end_ms = now_ms();
+        double duration = (global_end_ms - global_start_ms) / 1000;
         double fps = frame_cnt / duration;
         printf("Computed %ld frames in %lf seconds, averaging %lf FPS\n",
                frame_cnt, duration, fps);
 }
 
-void move_obj_to_gpu(void** d_v, void** d_f)
+int allocate_gpu_mem(gpu_mem_t* m)
 {
         cudaError_t ret;
-        ret = cudaMalloc(d_v, sizeof(model_v));
-        if (ret != cudaSuccess) printf("Error allocating GPU vertex buffer\n");
+        ret = cudaMalloc(&m->d_verts, sizeof(model_v));
+        if (ret != cudaSuccess)
+        {
+                printf("Failed to allocate vertex buffer on GPU!\n");
+                return -1;
+        }
 
-        ret = cudaMalloc(d_f, sizeof(model_f));
-        if (ret != cudaSuccess) printf("Error allocating GPU face buffer\n");
+        ret = cudaMalloc(&m->d_faces, sizeof(model_f));
+        if (ret != cudaSuccess)
+        {
+                printf("Failed to allocate face buffer on GPU!\n");
+                return -1;
+        }
 
-        ret =
-            cudaMemcpy(*d_v, model_v, sizeof(model_v), cudaMemcpyHostToDevice);
-        if (ret != cudaSuccess) printf("Error copying vertex buffer to GPU\n");
+        size_t edges = 3 * sizeof(model_f) / sizeof(model_f[0]);
+        ret = cudaMalloc(&m->d_drawn_edges, edges);
+        if (ret != cudaSuccess)
+        {
+                printf("Failed to allocate drawn edge buffer on GPU!\n");
+                return -1;
+        }
 
-        ret =
-            cudaMemcpy(*d_f, model_f, sizeof(model_f), cudaMemcpyHostToDevice);
-        if (ret != cudaSuccess) printf("Error copying face buffer to GPU\n");
+        ret = cudaMalloc(&m->d_verts_transform, sizeof(model_v));
+        if (ret != cudaSuccess)
+        {
+                printf(
+                    "Failed to allocate transformed vertex buffer on GPU!\n");
+                return -1;
+        }
+
+        ret = cudaMalloc(&m->d_frame_buf, WIDTH * HEIGHT * sizeof(color_t));
+        if (ret != cudaSuccess)
+        {
+                printf("Failed to allocate frame buffer on GPU!\n");
+                return -1;
+        }
+        return 0;
 }
 
-void cleanup_gpu_buf(void** d_v, void** d_f)
+int move_obj_to_gpu(gpu_mem_t* m)
 {
-        cudaFree(*d_v);
-        cudaFree(*d_f);
+        cudaError_t ret;
+        ret = cudaMemcpy(m->d_verts, model_v, sizeof(model_v),
+                         cudaMemcpyHostToDevice);
+        if (ret != cudaSuccess)
+        {
+                printf("Failed to copy vertex buffer to GPU!\n");
+                return -1;
+        }
+
+        ret = cudaMemcpy(m->d_faces, model_f, sizeof(model_f),
+                         cudaMemcpyHostToDevice);
+        if (ret != cudaSuccess)
+        {
+                printf("Failed to copy face buffer to GPU!\n");
+                return -1;
+        }
+        return 0;
+}
+
+void cleanup_gpu_buf(gpu_mem_t* m)
+{
+        cudaFree(m->d_frame_buf);
+        cudaFree(m->d_faces);
+        cudaFree(m->d_verts);
+        cudaFree(m->d_verts_transform);
+        cudaFree(m->d_drawn_edges);
+        *m = {NULL, NULL, NULL, NULL, NULL};
 }
 
 static inline void advance_rotation(fvec3 axis, mat_3x3f_t* m, float theta)
@@ -93,11 +207,14 @@ static inline double now_ms(void)
         return ms;
 }
 
-void main_loop()
+void main_loop(const gpu_mem_t m_context)
 {
         float angle = 0.0f;
         fvec3 rot_axis{1, 0, 0};  // would be nice to rotate this too!
         mat_3x3f_t m;
+
+        size_t num_verts = sizeof(model_v) / sizeof(model_v[0]);
+        size_t num_faces = sizeof(model_f) / sizeof(model_f[0]);
 
         double start_ms = now_ms();
         double end_ms = now_ms();
@@ -106,31 +223,51 @@ void main_loop()
                 start_ms = now_ms();
                 advance_rotation(rot_axis, &m, angle);
 
-				frame_cnt++;
+                frame_cnt++;
 
-                // call the vertex transformation kernel
-                //
-                // call the line draw kernel
-                //
+                // clear the frame buffer
+
+                cudaMemset(m_context.d_frame_buf, BLACK,
+                           WIDTH * HEIGHT * sizeof(color_t));
+
+                // launch the vertex transformation kernel
+                size_t threads_per_block = 256;
+                size_t blocks_v =
+                    (num_verts + threads_per_block - 1) / threads_per_block;
+                size_t blocks_f =
+                    (num_faces + threads_per_block - 1) / threads_per_block;
+
+                k_transform_vertices<<<blocks_v, threads_per_block>>>(
+                    m, m_context, num_verts);
+
+                cudaDeviceSynchronize();
+
+                // launch the line draw kernel
+                k_render_lines<<<blocks_f, threads_per_block>>>(m_context,
+                                                                num_faces);
+
+                cudaDeviceSynchronize();
+
                 // maybe display, we're mostly after frames for now?
 
                 end_ms = now_ms();
                 angle += (end_ms - start_ms) * PI_2 * ANGULAR_VELOCITY / 1000;
-                angle = fmodf(angle, PI_2);
+                // angle = fmodf(angle, PI_2);
         }
 }
 
 int main(void)
 {
-        void* dev_vertices = NULL;
-        void* dev_faces = NULL;
-        move_obj_to_gpu(&dev_vertices, &dev_faces);
+        gpu_mem_t m_context{NULL, NULL, NULL, NULL, NULL};
+        if (allocate_gpu_mem(&m_context) == -1) exit(-1);
+        if (move_obj_to_gpu(&m_context) == -1) exit(-1);
 
         signal(SIGINT, handle_sigint);
-        global_start = now_ms();
-        main_loop();
+        global_start_ms = now_ms();
 
-        cleanup_gpu_buf(&dev_vertices, &dev_faces);
+        main_loop(m_context);
+
+        cleanup_gpu_buf(&m_context);
 
         return 0;
 }
