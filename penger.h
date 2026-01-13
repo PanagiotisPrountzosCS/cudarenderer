@@ -15,7 +15,7 @@ extern "C"
         } Vec3;
         typedef struct
         {
-                int a, b, c;
+                int vi[3];
         } Tri;
 
         static const Vec3 model_v[] = {

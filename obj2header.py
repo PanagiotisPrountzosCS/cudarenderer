@@ -88,7 +88,7 @@ def write_header(outpath, verts, tris, prefix='model', fixed_type=None):
             f.write('typedef struct { %s x, y, z; } Vec3;\n' % fixed_type)
         else:
             f.write('typedef struct { float x, y, z; } Vec3;\n')
-        f.write('typedef struct { int a, b, c; } Tri;\n\n')
+        f.write('typedef struct { int vi[3]; } Tri;\n\n')
 
         vname = prefix + '_v'
         fname = prefix + '_f'
@@ -135,6 +135,14 @@ def main():
     if not verts:
         print('No vertices found in', args.input, file=sys.stderr)
         return 1
+
+    # Normalize vertices: find max absolute value across all coordinates
+    max_val = max(abs(coord) for v in verts for coord in v)
+    if max_val == 0:
+        print('All vertex coordinates are zero in', args.input, file=sys.stderr)
+        return 1
+    verts = [(x / max_val, y / max_val, z / max_val) for (x, y, z) in verts]
+
     tris = triangulate_faces(faces, len(verts))
     write_header(args.output, verts, tris, prefix=args.prefix, fixed_type=args.fixed)
     print('Wrote', args.output, ': %d verts, %d tris' % (len(verts), len(tris)))
